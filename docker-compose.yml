@@ -1,0 +1,32 @@
+services:
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./provisioning:/etc/grafana/provisioning:ro
+
+  influxdb:
+    image: influxdb:2.7
+    container_name: influxdb
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    # Example values only: replace them (or use a .env file) for a real setup.
+    # They are only applied on the first start, when the influxdb-data volume is empty.
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=changeme123
+      - DOCKER_INFLUXDB_INIT_ORG=npflive
+      - DOCKER_INFLUXDB_INIT_BUCKET=npflive
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=npflive-example-token
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+
+volumes:
+  grafana-data:
+  influxdb-data:
