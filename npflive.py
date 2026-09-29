@@ -24,7 +24,7 @@ import os
 import re
 import sys
 import time
-from typing import Dict, Optional, Set
+from typing import Callable, Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from parser import (DEFAULT_ACCEPT_ZERO, DEFAULT_RESULT_REGEX, RunInfo, SerieInfo,
@@ -42,10 +42,11 @@ def focus_spec(value: str):
         raise argparse.ArgumentTypeError(
             f"invalid focus '{value}', expected KIND or KIND:NAME[,NAME...] (e.g. EARL:SAMPLED_LATENCY0,FILLING_RATIO0)")
     names = m.group("names")
-    return m.group("kind"), set(names.split(",")) if names else None
+    # Keep the given order (it is the panel order), without duplicates
+    return m.group("kind"), list(dict.fromkeys(names.split(","))) if names else None
 
 
-def merge_focus(specs) -> Optional[Dict[str, Optional[Set[str]]]]:
+def merge_focus(specs) -> Optional[Dict[str, Optional[List[str]]]]:
     """Merge --focus specs into {kind: names}, names None meaning all results of that kind."""
     if not specs:
         return None
@@ -54,8 +55,28 @@ def merge_focus(specs) -> Optional[Dict[str, Optional[Set[str]]]]:
         if kind in focus and (focus[kind] is None or names is None):
             focus[kind] = None
         else:
-            focus[kind] = focus.get(kind, set()) | names if names is not None else None
+            focus[kind] = list(dict.fromkeys(focus.get(kind, []) + names)) if names is not None else None
     return focus
+
+
+def focus_rank(specs) -> Optional[Callable[[Tuple[str, str]], int]]:
+    """Sort key giving the position of a (kind, name) series in the --focus arguments.
+
+    -f EARL:A -f NRJ -f EARL:B orders A, then all NRJ series, then B. The sort is stable,
+    so series with the same rank (e.g. several NRJ ones) keep their order of appearance.
+    """
+    if not specs:
+        return None
+    positions: Dict[Tuple[str, Optional[str]], int] = {}
+    for kind, names in specs:
+        for name in (names or [None]):
+            positions.setdefault((kind, name), len(positions))
+
+    def rank(series: Tuple[str, str]) -> int:
+        kind, name = series
+        candidates = [positions[k] for k in ((kind, name), (kind, None)) if k in positions]
+        return min(candidates) if candidates else len(positions)
+    return rank
 
 
 class Sink:
@@ -91,7 +112,7 @@ class Sink:
                 if (kind, None) not in self.focus_seen:
                     missing.append(kind)
             else:
-                missing += [f"{kind}:{n}" for n in sorted(names) if (kind, n) not in self.focus_seen]
+                missing += [f"{kind}:{n}" for n in names if (kind, n) not in self.focus_seen]
         return missing
 
     @staticmethod
@@ -146,6 +167,7 @@ def setup_grafana(ap, args):
         grafana = Grafana(args.grafana_url, os.environ.get("GRAFANA_TOKEN"))
         grafana.ensure_datasource(args.influx_grafana_url, args.influx_org, args.influx_bucket, args.influx_token)
         grafana.ensure_folder()
+        grafana.check_refresh()
         if args.archive:
             n = grafana.archive_dashboards()
             if args.live_parsing:
@@ -153,7 +175,9 @@ def setup_grafana(ap, args):
     except Exception as e:
         # Fatal: reported even without --live-parsing, in argparse's error format
         ap.exit(1, f"{ap.prog}: error: Grafana export setup failed: {e}\n")
-    return GrafanaExporter(grafana, influx)
+    # Explicitly named series get their panel upfront, in --focus order
+    named = list(dict.fromkeys((kind, n) for kind, names in (args.focus or []) for n in (names or [])))
+    return GrafanaExporter(grafana, influx, focus_rank(args.focus), named)
 
 
 def main():

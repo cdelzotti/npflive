@@ -5,6 +5,9 @@ services:
     restart: unless-stopped
     ports:
       - "3000:3000"
+    environment:
+      # Allow npflive's dashboards to refresh every second (Grafana's default minimum is 5s)
+      - GF_DASHBOARDS_MIN_REFRESH_INTERVAL=1s
     volumes:
       - grafana-data:/var/lib/grafana
       - ./provisioning:/etc/grafana/provisioning:ro

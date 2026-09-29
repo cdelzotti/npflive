@@ -102,10 +102,15 @@ both run from this compose file.
 
 ### Dashboards
 
-- One dashboard per NPF run (`[run i/n for test j/k]`), created on the first focused sample of
-  the run: runs without time series get no dashboard. With `-l`, its URL is printed on stderr.
-- A text panel lists the run's variables, then one XY chart per time series, added as new
-  series appear: x is NPF's time index, y the value. Dashboards refresh every 5 s.
+- One dashboard per NPF run (`[run i/n for test j/k]`), created upfront: the first one right at
+  startup (titled "waiting for a run" until the first run header, which adopts it), the next ones
+  at each run header, before any value arrives. With `-l`, their URL is printed on stderr.
+- A text panel lists the run's variables, then one XY chart per time series: x is NPF's time
+  index, y the value. Panels of names given with `-f KIND:NAME` exist from the start, in
+  `--focus` order; series matched by a whole kind (`-f NRJ`) get their panel when they first
+  appear, at that spec's position. Dashboards refresh every second, which
+  needs `GF_DASHBOARDS_MIN_REFRESH_INTERVAL=1s` on Grafana (set in docker-compose.yml);
+  otherwise npflive falls back to Grafana's minimum (5 s by default).
 - `--archive` keeps the `npflive` folder readable: before the new runs start, all its
   dashboards are moved to the top-level `archive` folder (they keep their URL and data).
 - Comparison series (`npf ... repoA repoB`) are not plotted against each other: NPF runs each
