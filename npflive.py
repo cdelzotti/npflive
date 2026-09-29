@@ -135,18 +135,24 @@ class Sink:
             self.exporter.close()
 
 
-def setup_grafana(args):
+def setup_grafana(ap, args):
     """Check InfluxDB and Grafana before reading stdin, so errors show up before anything is consumed."""
+    import Grafana as grafana_module
     from Grafana import Grafana, GrafanaExporter, InfluxWriter
+    grafana_module.VERBOSE = args.live_parsing
     try:
         influx = InfluxWriter(args.influx_url, args.influx_org, args.influx_bucket, args.influx_token)
         influx.check()
         grafana = Grafana(args.grafana_url, os.environ.get("GRAFANA_TOKEN"))
         grafana.ensure_datasource(args.influx_grafana_url, args.influx_org, args.influx_bucket, args.influx_token)
         grafana.ensure_folder()
+        if args.archive:
+            n = grafana.archive_dashboards()
+            if args.live_parsing:
+                print(f"[npflive] archived {n} dashboard(s) into the archive folder", file=sys.stderr)
     except Exception as e:
-        print(f"[npflive] ERROR: Grafana export setup failed: {e}", file=sys.stderr)
-        sys.exit(1)
+        # Fatal: reported even without --live-parsing, in argparse's error format
+        ap.exit(1, f"{ap.prog}: error: Grafana export setup failed: {e}\n")
     return GrafanaExporter(grafana, influx)
 
 
@@ -160,7 +166,8 @@ def main():
     ap.add_argument("-q", "--quiet", action="store_true", help="Do not reprint NPF's output")
     ap.add_argument("-l", "--live-parsing", action="store_true",
                     help="Print run headers and results as they are parsed "
-                         "(on stdout with --quiet, on stderr otherwise to keep stdout transparent)")
+                         "(on stdout with --quiet, on stderr otherwise to keep stdout transparent), "
+                         "and npflive's messages. Without it, npflive prints nothing of its own")
     g = ap.add_argument_group("Grafana export", "Grafana auth: user:password in --grafana-url, "
                               "or the GRAFANA_TOKEN environment variable")
     g.add_argument("--grafana-url", help="Grafana URL, enables the export (e.g. http://admin:admin@localhost:3000)")
@@ -169,19 +176,24 @@ def main():
                    help="InfluxDB URL as seen from Grafana, for its datasource (default: %(default)s)")
     g.add_argument("--influx-org", default="npflive", help="InfluxDB organization (default: %(default)s)")
     g.add_argument("--influx-bucket", default="npflive", help="InfluxDB bucket (default: %(default)s)")
+    g.add_argument("--archive", action="store_true",
+                   help="At startup, move all dashboards of the npflive folder into the archive folder, "
+                        "so that npflive only contains the upcoming runs")
     g.add_argument("--influx-token", default="npflive-example-token",
                    help="InfluxDB API token (default: %(default)s, the docker-compose.yml example)")
     ap.add_argument("-f", "--focus", action="append", type=focus_spec, metavar="KIND[:NAME,...]",
-                    help="Only print these time series with --live-parsing (implied). "
+                    help="Only keep these time series, for --live-parsing and the Grafana export. "
                          "KIND is the time series kind (EARL in EARL-1.5-RESULT-X), NAME the exact result names. "
                          "e.g. --focus EARL:SAMPLED_LATENCY0,FILLING_RATIO0 --focus NRJ. "
                          "Repeatable, case-sensitive. Does not filter --log")
     args = ap.parse_args()
     focus = merge_focus(args.focus)
-    exporter = setup_grafana(args) if args.grafana_url else None
+    if args.archive and not args.grafana_url:
+        ap.error("--archive requires --grafana-url")
+    exporter = setup_grafana(ap, args) if args.grafana_url else None
 
     regexes = compile_regexes(args.regex or [DEFAULT_RESULT_REGEX])
-    sink = Sink(args.log, args.live_parsing or bool(focus),
+    sink = Sink(args.log, args.live_parsing,
                 sys.stdout if args.quiet else sys.stderr, focus, exporter)
     serie = SerieInfo()
     run = RunInfo()
@@ -219,7 +231,7 @@ def main():
     finally:
         sink.close()
     missing = sink.unmatched_focus()
-    if missing:
+    if missing and args.live_parsing:
         print(f"[npflive] WARNING: focus never matched: {', '.join(missing)}", file=sys.stderr)
 
 

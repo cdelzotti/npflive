@@ -22,6 +22,8 @@ import requests
 DATASOURCE_UID = "npflive-influx"
 FOLDER_TITLE = "npflive"
 FOLDER_UID = "npflive"
+ARCHIVE_TITLE = "archive"
+ARCHIVE_UID = "npflive-archive"  # top-level folder, next to npflive
 
 FLUSH_INTERVAL = 0.5        # seconds between InfluxDB writes
 FLUSH_LINES = 5000          # write earlier if that many lines are pending
@@ -29,8 +31,12 @@ DASHBOARD_INTERVAL = 2.0    # minimum seconds between two updates of the same da
 TIMEOUT = 10
 
 
+VERBOSE = False  # set by npflive: messages are only printed with --live-parsing
+
+
 def _log(msg):
-    print(f"[npflive] {msg}", file=sys.stderr, flush=True)
+    if VERBOSE:
+        print(f"[npflive] {msg}", file=sys.stderr, flush=True)
 
 
 # Line protocol escaping, see https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/
@@ -195,14 +201,34 @@ class Grafana:
         }), "datasource creation")
         _log(f"created Grafana datasource '{DATASOURCE_UID}' -> {influx_url}")
 
-    def ensure_folder(self):
-        r = self._req("GET", f"/api/folders/{FOLDER_UID}")
+    def ensure_folder(self, uid: str = FOLDER_UID, title: str = FOLDER_TITLE):
+        r = self._req("GET", f"/api/folders/{uid}")
         if r.status_code == 200:
             return
         if r.status_code != 404:
             self._check(r, "folder lookup")
-        self._check(self._req("POST", "/api/folders", json={"uid": FOLDER_UID, "title": FOLDER_TITLE}),
-                    "folder creation")
+        self._check(self._req("POST", "/api/folders", json={"uid": uid, "title": title}), "folder creation")
+
+    def archive_dashboards(self) -> int:
+        """Empty the npflive folder: move all its dashboards into the archive folder."""
+        self.ensure_folder(ARCHIVE_UID, ARCHIVE_TITLE)
+        uids, page = [], 1
+        while True:
+            found = self._check(self._req("GET", "/api/search", params={
+                "folderUIDs": FOLDER_UID, "type": "dash-db", "limit": 500, "page": page}), "dashboard search")
+            uids += [d["uid"] for d in found if d.get("folderUid") == FOLDER_UID and d["uid"] not in uids]
+            if len(found) < 500:
+                break
+            page += 1
+        for uid in uids:
+            dashboard = self._check(self._req("GET", f"/api/dashboards/uid/{uid}"), "dashboard read")
+            self._check(self._req("POST", "/api/dashboards/db", json={
+                "dashboard": dashboard["dashboard"],
+                "folderUid": ARCHIVE_UID,
+                "overwrite": True,
+                "message": "npflive: archived",
+            }), "dashboard archive")
+        return len(uids)
 
     def save_dashboard(self, dashboard: Dashboard):
         res = self._check(self._req("POST", "/api/dashboards/db", json={

@@ -21,7 +21,7 @@ npf ... ──► npflive.py ──► stdout (NPF output, byte-for-byte)
 ## Usage
 
 ```bash
-PYTHONUNBUFFERED=1 npf local --test run.npf | ./npflive.py -f EARL:SAMPLED_LATENCY0
+PYTHONUNBUFFERED=1 npf local --test run.npf | ./npflive.py -l -f EARL:SAMPLED_LATENCY0
 ```
 
 NPF must be run so that its output reaches the pipe live:
@@ -39,12 +39,13 @@ A saved output can be replayed with `cat output.dnc | ./npflive.py ...`.
 | Option | Description |
 |---|---|
 | `-q`, `--quiet` | Do not reprint NPF's output. |
-| `-l`, `--live-parsing` | Print run headers and parsed results as they arrive: on stderr (stdout stays identical to NPF's output), or on stdout with `-q`. |
-| `-f`, `--focus KIND[:NAME,...]` | Only keep these time series, for printing and for the Grafana export. Implies `-l`. Repeatable. |
+| `-l`, `--live-parsing` | Print run headers and parsed results as they arrive: on stderr (stdout stays identical to NPF's output), or on stdout with `-q`. Also enables npflive's messages (dashboard URLs, warnings). Without it, npflive prints nothing of its own. |
+| `-f`, `--focus KIND[:NAME,...]` | Only keep these time series, for `-l` and for the Grafana export. Repeatable. |
 | `--log FILE` | Append every parsed result as a JSON line (not filtered by `--focus`). |
 | `--regex REGEX` | Result regex, replaces NPF's default `result_regex` (repeatable). |
 | `--accept-zero TYPE...` | Result types for which a value of 0 is kept (NPF's `accept_zero`). |
 | `--grafana-url URL` | Enables the Grafana export, e.g. `http://admin:admin@localhost:3000`. |
+| `--archive` | At startup, empty the `npflive` folder: move all its dashboards into the `archive` folder, so `npflive` only contains the upcoming runs. |
 | `--influx-url URL` | InfluxDB URL used by npflive (default `http://localhost:8086`). |
 | `--influx-grafana-url URL` | InfluxDB URL as seen from Grafana, for its datasource (default `http://influxdb:8086`). |
 | `--influx-org`, `--influx-bucket` | InfluxDB organization and bucket (default `npflive`). |
@@ -63,7 +64,7 @@ NPF time series are printed as `KIND-TIME-RESULT-NAME VALUE`, e.g.
 - `-f EARL:WATT0 -f NRJ`: several specs, merged per kind.
 
 Matching is exact and case-sensitive; one-off results (`RESULT-X 5`) are never focused.
-Specs that never matched anything are reported on stderr at the end, to catch typos.
+With `-l`, specs that never matched anything are reported on stderr at the end, to catch typos.
 
 ## Examples
 
@@ -72,7 +73,7 @@ Specs that never matched anything are reported on stderr at the end, to catch ty
 PYTHONUNBUFFERED=1 npf local --test run.npf | ./npflive.py -l
 
 # Only the parsed values of two EARL series
-PYTHONUNBUFFERED=1 npf local --test run.npf | ./npflive.py -q -f EARL:SAMPLED_LATENCY0,SAMPLED_LATENCY1
+PYTHONUNBUFFERED=1 npf local --test run.npf | ./npflive.py -q -l -f EARL:SAMPLED_LATENCY0,SAMPLED_LATENCY1
 
 # Live Grafana dashboards
 PYTHONUNBUFFERED=1 npf local --test run.npf \
@@ -102,9 +103,11 @@ both run from this compose file.
 ### Dashboards
 
 - One dashboard per NPF run (`[run i/n for test j/k]`), created on the first focused sample of
-  the run: runs without time series get no dashboard. Its URL is printed on stderr.
+  the run: runs without time series get no dashboard. With `-l`, its URL is printed on stderr.
 - A text panel lists the run's variables, then one XY chart per time series, added as new
   series appear: x is NPF's time index, y the value. Dashboards refresh every 5 s.
+- `--archive` keeps the `npflive` folder readable: before the new runs start, all its
+  dashboards are moved to the top-level `archive` folder (they keep their URL and data).
 - Comparison series (`npf ... repoA repoB`) are not plotted against each other: NPF runs each
   one entirely before the next, so each run just gets its own dashboard.
 
@@ -134,4 +137,6 @@ and `t` (NPF's time index).
   of 0 is dropped unless its type is in `--accept-zero` or it belongs to a time series.
   Unlike NPF, repeated values are not aggregated (`result_add`/`result_append`): each sample
   is emitted as it arrives.
-- Grafana and InfluxDB errors are printed on stderr and never interrupt the pipe.
+- Grafana and InfluxDB errors during the run never interrupt the pipe; they are printed on
+  stderr with `-l`. Only a failed setup at startup (InfluxDB or Grafana unreachable) is always
+  reported, as `npflive.py: error: ...`, and stops npflive before it reads its input.
