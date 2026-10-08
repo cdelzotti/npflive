@@ -20,10 +20,10 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 DATASOURCE_UID = "npflive-influx"
-FOLDER_TITLE = "npflive"
+FOLDER_TITLE = "npflive"     # default dashboard folder (--folder)
 FOLDER_UID = "npflive"
 ARCHIVE_TITLE = "archive"
-ARCHIVE_UID = "npflive-archive"  # top-level folder, next to npflive
+ARCHIVE_UID = "npflive-archive"  # top-level folder, next to the dashboard folder
 
 FLUSH_INTERVAL = 0.5        # seconds between InfluxDB writes
 FLUSH_LINES = 5000          # write earlier if that many lines are pending
@@ -33,6 +33,10 @@ REFRESH = "1s"              # dashboard auto-refresh, raised to Grafana's min_re
 # Grafana's default refresh picker choices. The dashboard's refresh must be one of the
 # timepicker.refresh_intervals, or the frontend silently never starts the auto-refresh timer.
 REFRESH_INTERVALS = ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h", "2h", "1d"]
+
+# Grafana's classic palette: run k always gets RUN_COLORS[k-1], in every panel (--run-coalescing)
+RUN_COLORS = ["#7EB26D", "#EAB839", "#6ED0E0", "#EF843C", "#E24D42",
+              "#1F78C1", "#BA43A9", "#705DA0", "#508642", "#CCA300"]
 
 _DURATION_UNITS = {"ms": 0.001, "s": 1, "m": 60, "h": 3600, "d": 86400}
 
@@ -116,18 +120,46 @@ class Dashboard:
         self.tags: Dict[str, str] = {"run_id": run_id}  # plus repo/test, see GrafanaExporter
         self.url: Optional[str] = None
         self.refresh = REFRESH
+        self.coalesce = False       # one curve per run of the same test (--run-coalescing)
+        self.labels: List[str] = []  # extra Grafana dashboard tags (--tags), next to "npflive"
+        self.run_labels: List[str] = []  # "1", "2"... "2 retry 1": one curve each when coalescing
+        self.key = None             # identity of the test whose runs this dashboard gathers
 
     def _panel(self, i: int, kind: str, name: str) -> dict:
         # XY chart: x = NPF time series index (t in KIND-t-RESULT-NAME v), y = value.
-        # The range ignores the time picker: the run_id already selects this run's samples.
-        query = (f"from(bucket: {_flux_string(self.bucket)})\n"
+        # The range ignores the time picker: the run_id already selects this dashboard's samples.
+        def query(run: Optional[str] = None, column: str = "value") -> str:
+            run_filter = f" and r.run == {_flux_string(run)}" if run is not None else ""
+            q = (f"from(bucket: {_flux_string(self.bucket)})\n"
                  f"  |> range(start: 0)\n"
                  f"  |> filter(fn: (r) => r._measurement == {_flux_string(kind)}"
                  f" and r.name == {_flux_string(name)}"
-                 f" and r.run_id == {_flux_string(self.run_id)})\n"
+                 f" and r.run_id == {_flux_string(self.run_id)}{run_filter})\n"
                  f"  |> pivot(rowKey: [\"_time\"], columnKey: [\"_field\"], valueColumn: \"_value\")\n"
-                 f"  |> keep(columns: [\"t\", \"value\"])\n"
-                 f"  |> sort(columns: [\"t\"])")
+                 f"  |> keep(columns: [\"t\", \"value\"])\n")
+            if column != "value":
+                q += f"  |> rename(columns: {{value: {_flux_string(column)}}})\n"
+            return q + "  |> sort(columns: [\"t\"])"
+
+        if self.coalesce:
+            # One query, hence one frame, per run: each has its own t, so no run gets null values
+            # where another run has samples (the XY chart would draw them at y=0)
+            targets = [(f"R{j}", query(label, f"run {label}")) for j, label in enumerate(self.run_labels)]
+            mapping = {"mapping": "auto",  # every frame, every number field but x is a curve
+                       "series": [{"x": {"matcher": {"id": "byName", "options": "t"}}}],
+                       "legend": {"showLegend": True, "displayMode": "list", "placement": "bottom"}}
+            colors = [{"matcher": {"id": "byName", "options": f"run {label}"},
+                       "properties": [{"id": "color", "value": {
+                           "mode": "fixed", "fixedColor": RUN_COLORS[(int(label) - 1) % len(RUN_COLORS)]}}]}
+                      for label in self.run_labels if label.isdigit()]
+        else:
+            targets = [("A", query())]
+            mapping = {"mapping": "manual",
+                       "series": [{"frame": {"matcher": {"id": "byIndex", "options": 0}},
+                                   "x": {"matcher": {"id": "byName", "options": "t"}},
+                                   "y": {"matcher": {"id": "byName", "options": "value"}}}],
+                       "legend": {"showLegend": False}}
+            colors = []
         return {
             "id": i + 2,
             "type": "xychart",
@@ -137,24 +169,16 @@ class Dashboard:
             "title": f"{kind} {name}",
             "datasource": {"type": "influxdb", "uid": DATASOURCE_UID},
             "gridPos": {"x": (i % 2) * 12, "y": 4 + (i // 2) * 8, "w": 12, "h": 8},
-            "targets": [{"refId": "A", "datasource": {"type": "influxdb", "uid": DATASOURCE_UID},
-                         "query": query}],
+            "targets": [{"refId": ref, "datasource": {"type": "influxdb", "uid": DATASOURCE_UID},
+                         "query": q} for ref, q in targets],
             "fieldConfig": {
-                "defaults": {"custom": {"show": "points+lines", "pointSize": {"fixed": 3}}},
+                "defaults": {"custom": {"show": "points+lines", "pointSize": {"fixed": 3}, "axisLabel": name}},
                 "overrides": [
                     {"matcher": {"id": "byName", "options": "t"},
                      "properties": [{"id": "custom.axisLabel", "value": kind}]},
-                    {"matcher": {"id": "byName", "options": "value"},
-                     "properties": [{"id": "custom.axisLabel", "value": name}]},
-                ],
+                ] + colors,
             },
-            "options": {
-                "mapping": "manual",
-                "series": [{"frame": {"matcher": {"id": "byIndex", "options": 0}},
-                            "x": {"matcher": {"id": "byName", "options": "t"}},
-                            "y": {"matcher": {"id": "byName", "options": "value"}}}],
-                "legend": {"showLegend": False},
-            },
+            "options": mapping,
         }
 
     def to_json(self) -> dict:
@@ -169,7 +193,7 @@ class Dashboard:
         return {
             "uid": self.uid,
             "title": self.title,
-            "tags": ["npflive"],
+            "tags": list(dict.fromkeys(["npflive"] + self.labels)),
             "timezone": "browser",
             "refresh": self.refresh,
             "timepicker": {"refresh_intervals": list(dict.fromkeys([self.refresh] + REFRESH_INTERVALS))},
@@ -192,6 +216,7 @@ class Grafana:
         netloc = (parts.hostname or "") + (f":{parts.port}" if parts.port else "")
         self.url = urlunsplit((parts.scheme, netloc, parts.path.rstrip("/"), "", ""))
         self.refresh = REFRESH
+        self.folder_uid = FOLDER_UID  # where dashboards are saved, see use_folder
 
     def check_refresh(self):
         """Use REFRESH unless Grafana's min_refresh_interval is higher: it rejects faster dashboards."""
@@ -238,14 +263,28 @@ class Grafana:
             self._check(r, "folder lookup")
         self._check(self._req("POST", "/api/folders", json={"uid": uid, "title": title}), "folder creation")
 
+    def use_folder(self, title: str = FOLDER_TITLE):
+        """Save the dashboards into the top-level folder with this title, created if missing.
+        An existing folder is matched by title, so folders created by hand in Grafana work too."""
+        found = self._check(self._req("GET", "/api/folders", params={"limit": 1000}), "folder list")
+        for folder in found:
+            if folder.get("title") == title:
+                self.folder_uid = folder["uid"]
+                return
+        uid = FOLDER_UID if title == FOLDER_TITLE else "npflive-" + hashlib.sha1(title.encode()).hexdigest()[:12]
+        self.ensure_folder(uid, title)
+        self.folder_uid = uid
+
     def archive_dashboards(self) -> int:
-        """Empty the npflive folder: move all its dashboards into the archive folder."""
+        """Empty the dashboard folder: move all its dashboards into the archive folder."""
+        if self.folder_uid == ARCHIVE_UID:
+            raise RuntimeError(f"--archive cannot be used when dashboards go to the '{ARCHIVE_TITLE}' folder itself")
         self.ensure_folder(ARCHIVE_UID, ARCHIVE_TITLE)
         uids, page = [], 1
         while True:
             found = self._check(self._req("GET", "/api/search", params={
-                "folderUIDs": FOLDER_UID, "type": "dash-db", "limit": 500, "page": page}), "dashboard search")
-            uids += [d["uid"] for d in found if d.get("folderUid") == FOLDER_UID and d["uid"] not in uids]
+                "folderUIDs": self.folder_uid, "type": "dash-db", "limit": 500, "page": page}), "dashboard search")
+            uids += [d["uid"] for d in found if d.get("folderUid") == self.folder_uid and d["uid"] not in uids]
             if len(found) < 500:
                 break
             page += 1
@@ -262,7 +301,7 @@ class Grafana:
     def save_dashboard(self, dashboard: Dashboard):
         res = self._check(self._req("POST", "/api/dashboards/db", json={
             "dashboard": dashboard.to_json(),
-            "folderUid": FOLDER_UID,
+            "folderUid": self.folder_uid,
             "overwrite": True,
             "message": "npflive",
         }), "dashboard update")
@@ -273,9 +312,12 @@ class GrafanaExporter:
     """What npflive talks to: on_run / on_result / close. Work is done in a background thread."""
 
     def __init__(self, grafana: Grafana, influx: InfluxWriter, order=None,
-                 named: Optional[List[Tuple[str, str]]] = None):
+                 named: Optional[List[Tuple[str, str]]] = None, coalesce: bool = False,
+                 labels: Optional[List[str]] = None):
         """order: optional sort key on (kind, name) giving the panel order; default is order of appearance.
         named: (kind, name) series whose panels are created upfront in every dashboard.
+        coalesce: the runs of a same test share one dashboard, one curve per run.
+        labels: extra Grafana tags given to every dashboard.
 
         A first dashboard is created right away, before any run header, and the first run adopts it.
         """
@@ -283,6 +325,8 @@ class GrafanaExporter:
         self.influx = influx
         self.order = order
         self.named = sorted(named or [], key=order) if order else list(named or [])
+        self.coalesce = coalesce
+        self.labels = list(labels or [])
         self._count = 0
         self.queue: "queue.Queue" = queue.Queue()
         self.queue.put(("start", time.time()))
@@ -307,6 +351,7 @@ class GrafanaExporter:
         lines: List[str] = []
         dashboard: Optional[Dashboard] = None
         described = False           # whether the current dashboard already belongs to a run
+        run_label = ""              # "run" tag of the samples: run index (+ retry)
         dirty = False
         last_flush = last_dash = time.monotonic()
         closing = False
@@ -327,12 +372,22 @@ class GrafanaExporter:
                     serie, run, start = item[1:]
                     # Close the previous run: its samples and panels must land in its own dashboard
                     lines, dirty = self._flush(lines, dashboard, dirty)
-                    if dashboard is None or described:
-                        dashboard = self._new_dashboard(start)
-                    self._describe(dashboard, serie, run, start)
-                    described = True
-                    dirty = not self._save(dashboard)  # right away, not debounced
-                    last_dash = time.monotonic()
+                    run_label = f"{run.run}" + (f" retry {run.retry}" if run.retry else "")
+                    key = self._test_key(serie, run)
+                    if self.coalesce and described and dashboard is not None and dashboard.key == key:
+                        # Another run of the same test: same dashboard, new curve
+                        for label in self._run_labels(run):
+                            if label not in dashboard.run_labels:
+                                dashboard.run_labels.append(label)
+                                dirty = True
+                    else:
+                        if dashboard is None or described:
+                            dashboard = self._new_dashboard(start)
+                        dashboard.key, dashboard.run_labels = key, self._run_labels(run)
+                        self._describe(dashboard, serie, run, start)
+                        described = True
+                        dirty = not self._save(dashboard)  # right away, not debounced
+                        last_dash = time.monotonic()
                 elif item[0] == "result":
                     result, ts_ns = item[1:]
                     if dashboard is None:
@@ -342,7 +397,7 @@ class GrafanaExporter:
                         if self.order:
                             dashboard.series.sort(key=self.order)  # stable: ties keep appearance order
                         dirty = True
-                    lines.append(line_protocol(result.kind, {**dashboard.tags, "name": result.type},
+                    lines.append(line_protocol(result.kind, {**dashboard.tags, "name": result.type, "run": run_label},
                                                {"value": result.value, "t": result.time}, ts_ns))
 
             now = time.monotonic()
@@ -365,13 +420,32 @@ class GrafanaExporter:
                               f"Waiting for a run — started {stamp}", start_ms, self.influx.bucket)
         dashboard.series = list(self.named)
         dashboard.refresh = self.grafana.refresh
+        dashboard.coalesce = self.coalesce
+        dashboard.labels = self.labels
         return dashboard
+
+    @staticmethod
+    def _run_labels(run) -> List[str]:
+        """Curves expected for this test: all its runs, plus this retry if it is one."""
+        labels = [str(k) for k in range(1, max(run.n_runs, run.run, 1) + 1)]
+        if run.retry:
+            labels.append(f"{run.run} retry {run.retry}")
+        return labels
+
+    @staticmethod
+    def _test_key(serie, run):
+        """Runs with the same key are repetitions of the same test."""
+        return (serie.repo, serie.version, serie.test, run.test, run.n_tests, run.serie,
+                tuple(sorted(run.variables.items())))
 
     def _describe(self, dashboard: Dashboard, serie, run, start):
         """Give the dashboard its run: title, variables panel and repo/test tags."""
         repo = serie.repo if serie and serie.repo else "npf"
         test = serie.test if serie else ""
-        if run is not None and run.n_runs:
+        if run is not None and run.n_runs and self.coalesce:
+            where = f"test {run.test}/{run.n_tests} ({run.n_runs} run{'s' if run.n_runs > 1 else ''})"
+            variables = run.variables
+        elif run is not None and run.n_runs:
             where = f"test {run.test}/{run.n_tests} run {run.run}/{run.n_runs}"
             if run.retry:
                 where += f" retry {run.retry}"

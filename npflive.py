@@ -46,6 +46,14 @@ def focus_spec(value: str):
     return m.group("kind"), list(dict.fromkeys(names.split(","))) if names else None
 
 
+def tags_spec(value: str) -> List[str]:
+    """argparse type for --tags: TAG[,TAG...]"""
+    tags = [t.strip() for t in value.split(",") if t.strip()]
+    if not tags:
+        raise argparse.ArgumentTypeError(f"invalid tags {value!r}, expected TAG[,TAG...]")
+    return tags
+
+
 def merge_focus(specs) -> Optional[Dict[str, Optional[List[str]]]]:
     """Merge --focus specs into {kind: names}, names None meaning all results of that kind."""
     if not specs:
@@ -166,7 +174,7 @@ def setup_grafana(ap, args):
         influx.check()
         grafana = Grafana(args.grafana_url, os.environ.get("GRAFANA_TOKEN"))
         grafana.ensure_datasource(args.influx_grafana_url, args.influx_org, args.influx_bucket, args.influx_token)
-        grafana.ensure_folder()
+        grafana.use_folder(args.folder or "npflive")
         grafana.check_refresh()
         if args.archive:
             n = grafana.archive_dashboards()
@@ -177,7 +185,8 @@ def setup_grafana(ap, args):
         ap.exit(1, f"{ap.prog}: error: Grafana export setup failed: {e}\n")
     # Explicitly named series get their panel upfront, in --focus order
     named = list(dict.fromkeys((kind, n) for kind, names in (args.focus or []) for n in (names or [])))
-    return GrafanaExporter(grafana, influx, focus_rank(args.focus), named)
+    labels = list(dict.fromkeys(t for tags in (args.tags or []) for t in tags))
+    return GrafanaExporter(grafana, influx, focus_rank(args.focus), named, args.run_coalescing, labels)
 
 
 def main():
@@ -200,9 +209,17 @@ def main():
                    help="InfluxDB URL as seen from Grafana, for its datasource (default: %(default)s)")
     g.add_argument("--influx-org", default="npflive", help="InfluxDB organization (default: %(default)s)")
     g.add_argument("--influx-bucket", default="npflive", help="InfluxDB bucket (default: %(default)s)")
+    g.add_argument("--folder", metavar="TITLE",
+                   help="Grafana folder where new dashboards are saved, created if missing (default: npflive)")
     g.add_argument("--archive", action="store_true",
-                   help="At startup, move all dashboards of the npflive folder into the archive folder, "
-                        "so that npflive only contains the upcoming runs")
+                   help="At startup, move all dashboards of the --folder folder into the archive folder, "
+                        "so that it only contains the upcoming runs")
+    g.add_argument("--run-coalescing", action="store_true",
+                   help="Plot the runs of a same test (run 1/N... N/N) in one dashboard, one curve per run, "
+                        "with the same color for a given run in every panel")
+    g.add_argument("--tags", action="append", type=tags_spec, metavar="TAG[,TAG...]",
+                   help="Grafana tags added to every dashboard, next to npflive (repeatable), "
+                        "e.g. --tags earl,baseline")
     g.add_argument("--influx-token", default="npflive-example-token",
                    help="InfluxDB API token (default: %(default)s, the docker-compose.yml example)")
     ap.add_argument("-f", "--focus", action="append", type=focus_spec, metavar="KIND[:NAME,...]",
@@ -212,8 +229,9 @@ def main():
                          "Repeatable, case-sensitive. Does not filter --log")
     args = ap.parse_args()
     focus = merge_focus(args.focus)
-    if args.archive and not args.grafana_url:
-        ap.error("--archive requires --grafana-url")
+    for opt in ("archive", "run_coalescing", "tags", "folder"):
+        if getattr(args, opt) and not args.grafana_url:
+            ap.error(f"--{opt.replace('_', '-')} requires --grafana-url")
     exporter = setup_grafana(ap, args) if args.grafana_url else None
 
     regexes = compile_regexes(args.regex or [DEFAULT_RESULT_REGEX])

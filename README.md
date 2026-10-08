@@ -45,7 +45,10 @@ A saved output can be replayed with `cat output.dnc | ./npflive.py ...`.
 | `--regex REGEX` | Result regex, replaces NPF's default `result_regex` (repeatable). |
 | `--accept-zero TYPE...` | Result types for which a value of 0 is kept (NPF's `accept_zero`). |
 | `--grafana-url URL` | Enables the Grafana export, e.g. `http://admin:admin@localhost:3000`. |
-| `--archive` | At startup, empty the `npflive` folder: move all its dashboards into the `archive` folder, so `npflive` only contains the upcoming runs. |
+| `--folder TITLE` | Grafana folder where new dashboards are saved (default `npflive`). An existing top-level folder with this title is reused, otherwise it is created. |
+| `--archive` | At startup, empty the dashboard folder (`--folder`): move all its dashboards into the `archive` folder, so it only contains the upcoming runs. |
+| `--run-coalescing` | Plot the runs of a same test (`run 1/N` … `run N/N`) in one dashboard, one curve per run. |
+| `--tags TAG[,TAG...]` | Grafana tags added to every dashboard, next to `npflive` (repeatable). Handy to filter dashboards in Grafana's search. |
 | `--influx-url URL` | InfluxDB URL used by npflive (default `http://localhost:8086`). |
 | `--influx-grafana-url URL` | InfluxDB URL as seen from Grafana, for its datasource (default `http://influxdb:8086`). |
 | `--influx-org`, `--influx-bucket` | InfluxDB organization and bucket (default `npflive`). |
@@ -96,8 +99,8 @@ starts Grafana on port 3000 and InfluxDB on port 8086. The credentials in
 setup. They only apply on InfluxDB's first start, when its volume is empty.
 
 Everything else is done by npflive through the Grafana API at startup: it creates the
-`npflive InfluxDB` datasource (uid `npflive-influx`) and the `npflive` folder if they are
-missing. Grafana must reach InfluxDB at `--influx-grafana-url`: `http://influxdb:8086` works when
+`npflive InfluxDB` datasource (uid `npflive-influx`) and the dashboard folder (`--folder`,
+default `npflive`) if they are missing. Grafana must reach InfluxDB at `--influx-grafana-url`: `http://influxdb:8086` works when
 both run from this compose file.
 
 ### Dashboards
@@ -111,7 +114,11 @@ both run from this compose file.
   appear, at that spec's position. Dashboards refresh every second, which
   needs `GF_DASHBOARDS_MIN_REFRESH_INTERVAL=1s` on Grafana (set in docker-compose.yml);
   otherwise npflive falls back to Grafana's minimum (5 s by default).
-- `--archive` keeps the `npflive` folder readable: before the new runs start, all its
+- With `--run-coalescing`, the runs of a same test (same serie, test index and variables) share
+  one dashboard: each panel draws one curve per run, with a legend (`run 1`, `run 2`...) and the
+  same color for a given run in every panel (Grafana's classic palette, cycling after 10 runs).
+  Retried runs appear as `run K retry R`, with an automatic color.
+- `--archive` keeps the dashboard folder readable: before the new runs start, all its
   dashboards are moved to the top-level `archive` folder (they keep their URL and data).
 - Comparison series (`npf ... repoA repoB`) are not plotted against each other: NPF runs each
   one entirely before the next, so each run just gets its own dashboard.
@@ -121,11 +128,11 @@ both run from this compose file.
 Each sample is written with its arrival time:
 
 ```
-EARL,name=SAMPLED_LATENCY0,repo=EARL\ w/\ Heuristic,run_id=...,test=run.npf value=9,t=128
+EARL,name=SAMPLED_LATENCY0,repo=EARL\ w/\ Heuristic,run=1,run_id=...,test=run.npf value=9,t=128
 ```
 
-measurement = kind, tags `name`, `run_id` (one per dashboard), `repo`, `test`; fields `value`
-and `t` (NPF's time index).
+measurement = kind, tags `name`, `run_id` (one per dashboard), `run` (run index, plus
+` retry R` for retries), `repo`, `test`; fields `value` and `t` (NPF's time index).
 
 ## Files
 
