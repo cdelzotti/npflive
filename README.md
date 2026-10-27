@@ -34,11 +34,23 @@ NPF must be run so that its output reaches the pipe live:
 
 A saved output can be replayed with `cat output.dnc | ./npflive.py ...`.
 
+### Headless mode (without NPF)
+
+`--headless` parses the output of a program run by hand, without NPF: only `RESULT` lines
+are parsed, NPF's serie and run headers (`[repo] Running test ...`, `... [run i/n for test j/k]`)
+are neither expected nor recognized, and the whole input is a single run, plotted in a single
+dashboard titled `headless <start time>`. `--run-coalescing` is not available, as it needs run headers.
+
+```bash
+PYTHONUNBUFFERED=1 ./my_app 2>&1 | ./npflive.py --headless -l --grafana-url http://admin:admin@localhost:3000
+```
+
 ### Options
 
 | Option | Description |
 |---|---|
 | `-q`, `--quiet` | Do not reprint NPF's output. |
+| `--headless` | Parse the output of a program run without NPF: only `RESULT` lines, no NPF headers, one run (see [Headless mode](#headless-mode-without-npf)). |
 | `-l`, `--live-parsing` | Print run headers and parsed results as they arrive: on stderr (stdout stays identical to NPF's output), or on stdout with `-q`. Also enables npflive's messages (dashboard URLs, warnings). Without it, npflive prints nothing of its own. |
 | `-f`, `--focus KIND[:NAME,...]` | Only keep these time series, for `-l` and for the Grafana export. Repeatable. |
 | `--log FILE` | Append every parsed result as a JSON line (not filtered by `--focus`). |
@@ -48,6 +60,7 @@ A saved output can be replayed with `cat output.dnc | ./npflive.py ...`.
 | `--folder TITLE` | Grafana folder where new dashboards are saved (default `npflive`). An existing top-level folder with this title is reused, otherwise it is created. |
 | `--archive` | At startup, empty the dashboard folder (`--folder`): move all its dashboards into the `archive` folder, so it only contains the upcoming runs. |
 | `--run-coalescing` | Plot the runs of a same test (`run 1/N` … `run N/N`) in one dashboard, one curve per run. |
+| `--debug` | Always use the same `debug` dashboard, at Grafana's root (outside any folder): emptied at startup, then overwritten by each new run (or each new test with `--run-coalescing`). |
 | `--tags TAG[,TAG...]` | Grafana tags added to every dashboard, next to `npflive` (repeatable). Handy to filter dashboards in Grafana's search. |
 | `--influx-url URL` | InfluxDB URL used by npflive (default `http://localhost:8086`). |
 | `--influx-grafana-url URL` | InfluxDB URL as seen from Grafana, for its datasource (default `http://influxdb:8086`). |

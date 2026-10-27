@@ -12,6 +12,11 @@ in large blocks.
 With --quiet, NPF's output is not reprinted; combine with --live-parsing to get
 only the parsed results on stdout.
 
+With --headless, the input is any program's output instead of NPF's: only RESULT
+lines are parsed, NPF's serie and run headers are not expected (nor recognized),
+and the whole input is one run:
+    PYTHONUNBUFFERED=1 ./my_app 2>&1 | ./npflive.py --headless -l
+
 With --grafana-url, focused time series (all of them without --focus) are
 written to InfluxDB and plotted live in one Grafana dashboard per run:
     # Grafana auth: user:password in the URL, or the GRAFANA_TOKEN environment variable
@@ -176,6 +181,8 @@ def setup_grafana(ap, args):
         grafana.ensure_datasource(args.influx_grafana_url, args.influx_org, args.influx_bucket, args.influx_token)
         grafana.use_folder(args.folder or "npflive")
         grafana.check_refresh()
+        if args.debug:
+            grafana.reset_debug_dashboard()
         if args.archive:
             n = grafana.archive_dashboards()
             if args.live_parsing:
@@ -186,7 +193,8 @@ def setup_grafana(ap, args):
     # Explicitly named series get their panel upfront, in --focus order
     named = list(dict.fromkeys((kind, n) for kind, names in (args.focus or []) for n in (names or [])))
     labels = list(dict.fromkeys(t for tags in (args.tags or []) for t in tags))
-    return GrafanaExporter(grafana, influx, focus_rank(args.focus), named, args.run_coalescing, labels)
+    return GrafanaExporter(grafana, influx, focus_rank(args.focus), named, args.run_coalescing, labels, args.debug,
+                           args.headless)
 
 
 def main():
@@ -197,6 +205,10 @@ def main():
                     help="Result types for which a 0 value is kept (default: %(default)s)")
     ap.add_argument("--log", help="Append parsed results as JSON lines to this file")
     ap.add_argument("-q", "--quiet", action="store_true", help="Do not reprint NPF's output")
+    ap.add_argument("--headless", action="store_true",
+                    help="Parse the output of a program run without NPF: only RESULT lines are parsed, "
+                         "NPF's serie and run headers are ignored, and the whole input is one run "
+                         "(one Grafana dashboard)")
     ap.add_argument("-l", "--live-parsing", action="store_true",
                     help="Print run headers and results as they are parsed "
                          "(on stdout with --quiet, on stderr otherwise to keep stdout transparent), "
@@ -217,6 +229,9 @@ def main():
     g.add_argument("--run-coalescing", action="store_true",
                    help="Plot the runs of a same test (run 1/N... N/N) in one dashboard, one curve per run, "
                         "with the same color for a given run in every panel")
+    g.add_argument("--debug", action="store_true",
+                   help="Always use the same 'debug' dashboard, at Grafana's root (no folder), "
+                        "emptied at startup and overwritten by each new run")
     g.add_argument("--tags", action="append", type=tags_spec, metavar="TAG[,TAG...]",
                    help="Grafana tags added to every dashboard, next to npflive (repeatable), "
                         "e.g. --tags earl,baseline")
@@ -229,9 +244,11 @@ def main():
                          "Repeatable, case-sensitive. Does not filter --log")
     args = ap.parse_args()
     focus = merge_focus(args.focus)
-    for opt in ("archive", "run_coalescing", "tags", "folder"):
+    for opt in ("archive", "run_coalescing", "tags", "folder", "debug"):
         if getattr(args, opt) and not args.grafana_url:
             ap.error(f"--{opt.replace('_', '-')} requires --grafana-url")
+    if args.headless and args.run_coalescing:
+        ap.error("--run-coalescing requires NPF's run headers, it cannot be used with --headless")
     exporter = setup_grafana(ap, args) if args.grafana_url else None
 
     regexes = compile_regexes(args.regex or [DEFAULT_RESULT_REGEX])
@@ -251,13 +268,14 @@ def main():
                 stdout.flush()
 
             line = raw.decode("utf-8", errors="replace")
-            new_serie = parse_serie_header(line)
+            # Headless: no NPF headers, the whole input is one run
+            new_serie = None if args.headless else parse_serie_header(line)
             if new_serie:
                 serie = new_serie
                 run = RunInfo()
                 sink.on_serie(serie)
                 continue
-            header = parse_run_header(line)
+            header = None if args.headless else parse_run_header(line)
             if header:
                 run = header
                 sink.on_run(serie, run)

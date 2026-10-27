@@ -24,6 +24,8 @@ FOLDER_TITLE = "npflive"     # default dashboard folder (--folder)
 FOLDER_UID = "npflive"
 ARCHIVE_TITLE = "archive"
 ARCHIVE_UID = "npflive-archive"  # top-level folder, next to the dashboard folder
+DEBUG_TITLE = "debug"       # --debug: the single dashboard every run reuses, at the root (no folder)
+DEBUG_UID = "npflive-debug"
 
 FLUSH_INTERVAL = 0.5        # seconds between InfluxDB writes
 FLUSH_LINES = 5000          # write earlier if that many lines are pending
@@ -122,6 +124,7 @@ class Dashboard:
         self.refresh = REFRESH
         self.coalesce = False       # one curve per run of the same test (--run-coalescing)
         self.labels: List[str] = []  # extra Grafana dashboard tags (--tags), next to "npflive"
+        self.debug = False          # the --debug dashboard: saved at the root, not in the folder
         self.run_labels: List[str] = []  # "1", "2"... "2 retry 1": one curve each when coalescing
         self.key = None             # identity of the test whose runs this dashboard gathers
 
@@ -298,10 +301,20 @@ class Grafana:
             }), "dashboard archive")
         return len(uids)
 
+    def reset_debug_dashboard(self):
+        """Overwrite the --debug dashboard with an empty one at the root, so that it starts fresh."""
+        self._check(self._req("POST", "/api/dashboards/db", json={
+            "dashboard": {"uid": DEBUG_UID, "title": DEBUG_TITLE, "tags": ["npflive"], "panels": [],
+                          "schemaVersion": 39},
+            "folderUid": "",
+            "overwrite": True,
+            "message": "npflive: debug reset",
+        }), "debug dashboard reset")
+
     def save_dashboard(self, dashboard: Dashboard):
         res = self._check(self._req("POST", "/api/dashboards/db", json={
             "dashboard": dashboard.to_json(),
-            "folderUid": self.folder_uid,
+            "folderUid": "" if dashboard.debug else self.folder_uid,
             "overwrite": True,
             "message": "npflive",
         }), "dashboard update")
@@ -313,11 +326,13 @@ class GrafanaExporter:
 
     def __init__(self, grafana: Grafana, influx: InfluxWriter, order=None,
                  named: Optional[List[Tuple[str, str]]] = None, coalesce: bool = False,
-                 labels: Optional[List[str]] = None):
+                 labels: Optional[List[str]] = None, debug: bool = False, headless: bool = False):
         """order: optional sort key on (kind, name) giving the panel order; default is order of appearance.
         named: (kind, name) series whose panels are created upfront in every dashboard.
         coalesce: the runs of a same test share one dashboard, one curve per run.
         labels: extra Grafana tags given to every dashboard.
+        debug: every run reuses the same root-level "debug" dashboard, overwritten from scratch.
+        headless: no NPF run headers are expected: the startup dashboard is the only one, described right away.
 
         A first dashboard is created right away, before any run header, and the first run adopts it.
         """
@@ -327,6 +342,9 @@ class GrafanaExporter:
         self.named = sorted(named or [], key=order) if order else list(named or [])
         self.coalesce = coalesce
         self.labels = list(labels or [])
+        self.debug = debug
+        self.headless = headless
+        self._announced = set()     # uids of the dashboards whose URL was printed
         self._count = 0
         self.queue: "queue.Queue" = queue.Queue()
         self.queue.put(("start", time.time()))
@@ -368,6 +386,10 @@ class GrafanaExporter:
                 elif item[0] == "start":
                     # Created at startup, before any run header: the first run adopts it
                     dashboard, described, dirty = self._new_dashboard(item[1]), False, True
+                    if self.headless:
+                        # No run header will come: the whole input is one run
+                        self._describe(dashboard, None, None, item[1])
+                        described = True
                 elif item[0] == "run":
                     serie, run, start = item[1:]
                     # Close the previous run: its samples and panels must land in its own dashboard
@@ -415,9 +437,13 @@ class GrafanaExporter:
         start_ms = int(start * 1000)
         stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start))
         run_id = f"{start_ms}-{self._count}"
-        uid = "npf-" + hashlib.sha1(run_id.encode()).hexdigest()[:12]
-        dashboard = Dashboard(uid, f"npflive {stamp} (waiting for a run)", run_id,
-                              f"Waiting for a run — started {stamp}", start_ms, self.influx.bucket)
+        if self.debug:
+            uid, title = DEBUG_UID, DEBUG_TITLE
+        else:
+            uid = "npf-" + hashlib.sha1(run_id.encode()).hexdigest()[:12]
+            title = f"npflive {stamp} (waiting for a run)"
+        dashboard = Dashboard(uid, title, run_id, f"Waiting for a run — started {stamp}", start_ms, self.influx.bucket)
+        dashboard.debug = self.debug
         dashboard.series = list(self.named)
         dashboard.refresh = self.grafana.refresh
         dashboard.coalesce = self.coalesce
@@ -440,7 +466,7 @@ class GrafanaExporter:
 
     def _describe(self, dashboard: Dashboard, serie, run, start):
         """Give the dashboard its run: title, variables panel and repo/test tags."""
-        repo = serie.repo if serie and serie.repo else "npf"
+        repo = serie.repo if serie and serie.repo else ("headless" if self.headless else "npf")
         test = serie.test if serie else ""
         if run is not None and run.n_runs and self.coalesce:
             where = f"test {run.test}/{run.n_tests} ({run.n_runs} run{'s' if run.n_runs > 1 else ''})"
@@ -453,8 +479,9 @@ class GrafanaExporter:
         else:
             where, variables = "", {}
         stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start))
-        dashboard.title = " ".join(x for x in [repo, test, where, stamp] if x)
-        info = f"**{repo}** `{test}` {where} — started {stamp}\n\n"
+        if not self.debug:
+            dashboard.title = " ".join(x for x in [repo, test, where, stamp] if x)
+        info = " ".join(x for x in [f"**{repo}**", f"`{test}`" if test else "", where] if x) + f" — started {stamp}\n\n"
         if variables:
             info += "| Variable | Value |\n|---|---|\n" + "".join(
                 f"| {k} | {str(v).replace('|', '&#124;')} |\n" for k, v in variables.items())
@@ -475,12 +502,12 @@ class GrafanaExporter:
         return []
 
     def _save(self, dashboard: Dashboard) -> bool:
-        new = dashboard.url is None
         try:
             self.grafana.save_dashboard(dashboard)
         except Exception as e:
             _log(f"WARNING: {e}")
             return False
-        if new:
+        if dashboard.uid not in self._announced:  # --debug: printed once, every run reuses it
+            self._announced.add(dashboard.uid)
             _log(f"dashboard: {dashboard.url}")
         return True
